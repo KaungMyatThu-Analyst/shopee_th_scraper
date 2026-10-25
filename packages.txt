@@ -4,7 +4,7 @@ libatk1.0-0
 libatk-bridge2.0-0
 libcups2
 libdrm2
-bibxkbcommon0
+libxkbcommon0
 libxcomposite1
 libxdamage1
 libxfixes3
