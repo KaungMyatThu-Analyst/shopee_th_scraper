@@ -18,19 +18,34 @@ Usage:
     python shopee_scraper_multi.py --keywords serum "ครีมกันแดด" --output results.csv
     python shopee_scraper_multi.py --channel chrome        # use installed Google Chrome
 
-Log in once by hand (session is saved to the profile):
+Log in once by hand on your own computer (session is saved to the profile):
     python shopee_scraper_multi.py --login
+    python shopee_scraper_multi.py --login --storage-state shopee_state.json   # also export for a server
 
-Close any other browser window that uses the same profile folder before running.
+Runs on your own computer AND on a headless Linux server such as Streamlit Community Cloud:
+  * Desktop: visible browser + persistent profile (./shopee_profile), so logins/captchas stick.
+    Close any other browser window that uses the same profile folder before running.
+  * Server/cloud: headless browser, container-safe Chromium flags (--no-sandbox,
+    --disable-dev-shm-usage, --disable-gpu) and a standard non-persistent context, so profile
+    locks can never break the launch. Detection is automatic; override with flags or env vars:
+
+      --headless / --headed          SHOPEE_HEADLESS=1|0
+      --ephemeral / --persistent     SHOPEE_EPHEMERAL=1|0
+      --storage-state FILE           SHOPEE_STORAGE_STATE=FILE  or  SHOPEE_STORAGE_STATE_JSON='{...}'
+      (force cloud detection)        SHOPEE_CLOUD=1|0
 """
 
 import argparse
 import csv
 import json
+import os
 import random
 import re
+import subprocess
 import sys
+import time
 from collections import deque
+from dataclasses import dataclass, replace as dc_replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import quote
@@ -72,6 +87,17 @@ LAUNCH_ARGS = [
     "--disable-infobars",
     "--no-first-run",
     "--no-default-browser-check",
+]
+
+# Extra flags for containers / headless servers (Streamlit Cloud, Docker, CI):
+#   --no-sandbox              the Chromium sandbox needs kernel features containers usually lack
+#   --disable-dev-shm-usage   /dev/shm is tiny in containers; use /tmp instead (prevents crashes)
+#   --disable-gpu             no GPU on servers
+SERVER_LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
 ]
 
 STEALTH_JS = """
@@ -507,30 +533,327 @@ def polite_pause(page: Page, bounds: Tuple[float, float], label: str) -> None:
     page.wait_for_timeout(int(seconds * 1000))
 
 
+# --------------------------------------------------------------------------- #
+# Environment detection and browser launching (local desktop vs. cloud server)
+# --------------------------------------------------------------------------- #
+INTERACTIVE = True  # set in main(); False means "nobody can answer prompts" (headless/cloud/no terminal)
+
+
 def ask(message: str) -> str:
-    """Prompt the user; returns '' for Enter, or the lowercase answer. EOF counts as 'skip'."""
+    """
+    Prompt the user; returns '' for Enter, or the lowercase answer.
+    In non-interactive runs (headless/cloud, or no terminal) nobody can answer, so it waits a few
+    seconds and returns '' (= "retry/continue") instead of blocking forever.
+    """
+    if not INTERACTIVE:
+        first_line = next((ln.strip() for ln in message.splitlines() if ln.strip()), "")
+        wait = random.uniform(5, 10)
+        print(f"[info] Non-interactive run, no one to ask ({first_line}). Continuing in {wait:.0f}s.")
+        time.sleep(wait)
+        return ""
     try:
         return input(message).strip().lower()
     except EOFError:
         return "s"
 
 
-def launch_context(pw, profile_dir: str, channel: Optional[str]) -> BrowserContext:
-    Path(profile_dir).mkdir(parents=True, exist_ok=True)
-    kwargs: Dict[str, Any] = dict(
-        user_data_dir=str(Path(profile_dir).resolve()),
-        headless=False,
-        args=LAUNCH_ARGS,
-        ignore_default_args=["--enable-automation"],
+def env_flag(name: str) -> Optional[bool]:
+    """Read a boolean environment variable; None if unset/empty."""
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
+def has_display() -> bool:
+    """Windows/macOS always have a GUI session; Linux needs DISPLAY or WAYLAND_DISPLAY."""
+    if not sys.platform.startswith("linux"):
+        return True
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
+
+def is_cloud_environment() -> bool:
+    """Best-effort detection of Streamlit Community Cloud / containers. Override: SHOPEE_CLOUD=1|0."""
+    forced = env_flag("SHOPEE_CLOUD")
+    if forced is not None:
+        return forced
+    markers = (
+        Path("/mount/src").exists(),                        # Streamlit Community Cloud checkout path
+        os.environ.get("HOME", "") == "/home/adminuser",     # Streamlit Community Cloud user
+        Path("/.dockerenv").exists(),                        # generic Docker container
+        bool(os.environ.get("KUBERNETES_SERVICE_HOST")),     # Kubernetes
+    )
+    return any(markers)
+
+
+@dataclass
+class BrowserConfig:
+    profile_dir: str = DEFAULT_PROFILE_DIR
+    channel: Optional[str] = None
+    headless: bool = False
+    ephemeral: bool = False              # True = standard browser + fresh context (no profile folder)
+    server_mode: bool = False            # True = add container-safe Chromium flags
+    storage_state: Optional[str] = None  # cookies/session JSON (input for scraping, output for --login)
+
+
+class Session:
+    """A launched browser: a persistent context, or a standard browser + context."""
+
+    def __init__(self, context: BrowserContext, browser: Any = None, mode: str = "persistent") -> None:
+        self.context = context
+        self.browser = browser
+        self.mode = mode
+
+    def close(self) -> None:
+        for obj in (self.context, self.browser):
+            if obj is None:
+                continue
+            try:
+                obj.close()
+            except Exception:
+                pass
+
+
+# ----- error classification ------------------------------------------------- #
+def error_text(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}".lower()
+
+
+def is_target_closed_error(exc: BaseException) -> bool:
+    text = error_text(exc)
+    return type(exc).__name__ == "TargetClosedError" or "has been closed" in text or "target closed" in text
+
+
+def is_missing_channel_error(exc: BaseException) -> bool:
+    text = error_text(exc)
+    return "distribution" in text and "not found" in text
+
+
+def is_missing_browser_error(exc: BaseException) -> bool:
+    text = error_text(exc)
+    if is_missing_channel_error(exc):
+        return False
+    return "executable doesn't exist" in text or "playwright install" in text
+
+
+def is_missing_deps_error(exc: BaseException) -> bool:
+    text = error_text(exc)
+    return ("missing dependencies" in text or "install-deps" in text
+            or "error while loading shared libraries" in text)
+
+
+def is_profile_lock_error(exc: BaseException) -> bool:
+    text = error_text(exc)
+    markers = ("processsingleton", "singletonlock", "profile appears to be in use",
+               "opening in existing browser session", "already in use")
+    return is_target_closed_error(exc) or any(m in text for m in markers)
+
+
+# ----- recovery helpers ----------------------------------------------------- #
+_INSTALL_ATTEMPTED = False
+
+
+def install_chromium() -> bool:
+    """One-time `playwright install chromium` (the browser is not shipped with the pip package)."""
+    global _INSTALL_ATTEMPTED
+    if _INSTALL_ATTEMPTED:
+        return False
+    _INSTALL_ATTEMPTED = True
+    print("[info] Playwright's Chromium is missing; installing it now (one-time, can take a minute)...")
+    try:
+        result = subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"],
+                                capture_output=True, text=True, timeout=900)
+    except Exception as exc:
+        print(f"[warn] Could not run 'playwright install chromium': {exc!r}", file=sys.stderr)
+        return False
+    if result.returncode != 0:
+        tail = (result.stderr or result.stdout or "").strip().splitlines()[-3:]
+        print("[warn] 'playwright install chromium' failed: " + " | ".join(tail), file=sys.stderr)
+        return False
+    print("[info] Chromium installed.")
+    return True
+
+
+def clear_stale_profile_locks(profile_dir: str) -> bool:
+    """
+    Remove Chromium's Singleton* lock files left behind by a crashed browser (Linux/macOS).
+    Refuses to touch them if the PID recorded in SingletonLock is still running.
+    Returns True only if stale locks were removed.
+    """
+    if os.name != "posix":
+        return False
+    base = Path(profile_dir)
+    lock = base / "SingletonLock"
+    if not (lock.is_symlink() or lock.exists()):
+        return False
+    try:
+        pid = int(os.readlink(lock).rsplit("-", 1)[1])   # symlink target looks like "hostname-12345"
+    except (OSError, ValueError, IndexError):
+        return False                                      # cannot prove it is stale -> leave it alone
+    if pid != os.getpid():
+        try:
+            os.kill(pid, 0)                               # signal 0 = "is this process alive?"
+            print(f"[warn] Profile is in use by running process {pid}; not removing its lock.",
+                  file=sys.stderr)
+            return False
+        except ProcessLookupError:
+            pass                                          # process is gone -> lock is stale
+        except PermissionError:
+            return False                                  # alive, owned by someone else
+    removed = False
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        path = base / name
+        try:
+            if path.is_symlink() or path.exists():
+                path.unlink()
+                removed = True
+        except OSError:
+            pass
+    if removed:
+        print(f"[info] Removed stale browser profile locks in {base}.")
+    return removed
+
+
+def load_storage_state(path: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Saved login session: a JSON file (--storage-state / SHOPEE_STORAGE_STATE) or raw JSON in
+    SHOPEE_STORAGE_STATE_JSON (handy for Streamlit secrets). Returns None if nothing usable."""
+    path = path or os.environ.get("SHOPEE_STORAGE_STATE")
+    raw_json = os.environ.get("SHOPEE_STORAGE_STATE_JSON")
+    try:
+        if path and Path(path).exists():
+            return json.loads(Path(path).read_text(encoding="utf-8"))
+        if raw_json:
+            return json.loads(raw_json)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"[warn] Could not load the saved session: {exc!r}", file=sys.stderr)
+    return None
+
+
+# ----- launching ------------------------------------------------------------ #
+def launch_args(cfg: BrowserConfig) -> List[str]:
+    return LAUNCH_ARGS + (SERVER_LAUNCH_ARGS if cfg.server_mode else [])
+
+
+def context_options() -> Dict[str, Any]:
+    return dict(
         user_agent=USER_AGENT,
         viewport=VIEWPORT,
         locale=LOCALE,
         timezone_id=TIMEZONE,
         extra_http_headers={"Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7"},
     )
+
+
+def _launch_persistent(pw, cfg: BrowserConfig, channel: Optional[str]) -> Session:
+    Path(cfg.profile_dir).mkdir(parents=True, exist_ok=True)
+    kwargs: Dict[str, Any] = dict(
+        user_data_dir=str(Path(cfg.profile_dir).resolve()),
+        headless=cfg.headless,
+        args=launch_args(cfg),
+        ignore_default_args=["--enable-automation"],
+        **context_options(),
+    )
     if channel:
-        kwargs["channel"] = channel  # e.g. "chrome" to use the installed Google Chrome
-    return pw.chromium.launch_persistent_context(**kwargs)
+        kwargs["channel"] = channel
+    return Session(pw.chromium.launch_persistent_context(**kwargs), mode="persistent")
+
+
+def _launch_ephemeral(pw, cfg: BrowserConfig, channel: Optional[str]) -> Session:
+    kwargs: Dict[str, Any] = dict(
+        headless=cfg.headless,
+        args=launch_args(cfg),
+        ignore_default_args=["--enable-automation"],
+    )
+    if channel:
+        kwargs["channel"] = channel
+    browser = pw.chromium.launch(**kwargs)
+    try:
+        options = context_options()
+        state = load_storage_state(cfg.storage_state)
+        if state:
+            options["storage_state"] = state
+            print("[info] Loaded saved Shopee session (cookies) into the browser context.")
+        context = browser.new_context(**options)
+    except Exception:
+        try:
+            browser.close()
+        except Exception:
+            pass
+        raise
+    return Session(context, browser, mode="ephemeral")
+
+
+def _with_recovery(launch, profile_dir: Optional[str] = None) -> Session:
+    """Run `launch()`; on a known failure try one fix (install browser / clear stale lock) and retry."""
+    try:
+        return launch()
+    except Exception as exc:
+        recovered = False
+        if is_missing_browser_error(exc):
+            recovered = install_chromium()
+        elif profile_dir and is_profile_lock_error(exc):
+            recovered = clear_stale_profile_locks(profile_dir)
+        if not recovered:
+            raise
+        return launch()
+
+
+def open_session(pw, cfg: BrowserConfig) -> Session:
+    """
+    Launch the browser safely for the current environment:
+      1. persistent profile (unless cfg.ephemeral), recovering from a missing browser binary or
+         stale profile locks once;
+      2. otherwise / on failure, a standard browser + fresh context (no profile, no locks);
+      3. a requested channel (e.g. "chrome") that isn't installed falls back to bundled Chromium.
+    """
+    channels: List[Optional[str]] = [cfg.channel, None] if cfg.channel else [None]
+    last_exc: Optional[Exception] = None
+
+    if not cfg.ephemeral:
+        for channel in channels:
+            try:
+                return _with_recovery(lambda: _launch_persistent(pw, cfg, channel), cfg.profile_dir)
+            except Exception as exc:
+                last_exc = exc
+                if channel and is_missing_channel_error(exc):
+                    print(f"[warn] Browser channel '{channel}' not found; using bundled Chromium.",
+                          file=sys.stderr)
+                    continue
+                reason = (str(exc).strip().splitlines() or [type(exc).__name__])[0]
+                print(f"[warn] Persistent profile launch failed ({type(exc).__name__}: {reason}).",
+                      file=sys.stderr)
+                break
+        print("[warn] Falling back to a standard (non-persistent) browser context.", file=sys.stderr)
+
+    for channel in channels:
+        try:
+            return _with_recovery(lambda: _launch_ephemeral(pw, cfg, channel))
+        except Exception as exc:
+            last_exc = exc
+            if channel and is_missing_channel_error(exc):
+                print(f"[warn] Browser channel '{channel}' not found; using bundled Chromium.",
+                      file=sys.stderr)
+                continue
+            break
+
+    raise last_exc if last_exc else RuntimeError("Could not launch the browser")
+
+
+def print_launch_help(exc: BaseException) -> None:
+    lines = str(exc).strip().splitlines()
+    headline = lines[0] if lines else ""
+    print(f"[error] Could not launch the browser: {type(exc).__name__}: {headline}", file=sys.stderr)
+    if is_missing_deps_error(exc):
+        print("        Chromium's system libraries are missing. On Streamlit Community Cloud list them in\n"
+              "        packages.txt (libnss3, libnspr4, libatk1.0-0, libatk-bridge2.0-0, libcups2, libdrm2,\n"
+              "        libgbm1, libxkbcommon0, libasound2, ...) and reboot the app.", file=sys.stderr)
+    elif is_missing_browser_error(exc):
+        print("        The Playwright browser is not installed. Run: python -m playwright install chromium",
+              file=sys.stderr)
+    elif is_profile_lock_error(exc):
+        print("        The browser exited right after starting. Common causes: low memory, a tiny /dev/shm,\n"
+              "        missing system libraries, or (locally) the profile folder open in another browser.",
+              file=sys.stderr)
 
 
 def build_search_url(keyword: str, page_idx: int) -> str:
@@ -644,25 +967,31 @@ def scrape_page(page: Page, captured: List[Any], keyword: str, page_idx: int,
 # --------------------------------------------------------------------------- #
 # All keywords x all pages
 # --------------------------------------------------------------------------- #
-def scrape_all(keywords: List[str], max_pages: int, profile_dir: str, scroll_rounds: int,
-               retries: int, channel: Optional[str], debug: bool, output_csv: str) -> ProductStore:
+MAX_BROWSER_RESTARTS = 2  # headless only: relaunch if the browser crashes mid-run (e.g. out of memory)
+
+
+def scrape_all(keywords: List[str], max_pages: int, cfg: BrowserConfig, scroll_rounds: int,
+               retries: int, debug: bool, output_csv: str) -> ProductStore:
     store = ProductStore()
     captured: List[Any] = []
     total_keywords = len(keywords)
 
     with sync_playwright() as pw:
+        def start_browser() -> Tuple[Session, Page]:
+            session = open_session(pw, cfg)
+            session.context.add_init_script(STEALTH_JS)
+            session.context.on("response", make_response_handler(captured))  # covers every page/tab
+            page = session.context.pages[0] if session.context.pages else session.context.new_page()
+            return session, page
+
         try:
-            context = launch_context(pw, profile_dir, channel)
+            session, page = start_browser()
         except Exception as exc:
-            print(f"[error] Could not launch the persistent context: {exc!r}\n"
-                  "        Close any other browser using this profile folder and try again.",
-                  file=sys.stderr)
+            print_launch_help(exc)
             return store
+        print(f"[info] Browser ready ({session.mode} context, headless={cfg.headless}).")
 
-        context.add_init_script(STEALTH_JS)
-        context.on("response", make_response_handler(captured))  # covers every page/tab
-        page = context.pages[0] if context.pages else context.new_page()
-
+        restarts = 0
         try:
             for k_idx, keyword in enumerate(keywords, 1):
                 print(f"\n{'=' * 70}\n[keyword {k_idx}/{total_keywords}] '{keyword}' "
@@ -672,8 +1001,21 @@ def scrape_all(keywords: List[str], max_pages: int, profile_dir: str, scroll_rou
                 for page_idx in range(max_pages):
                     print(f"[keyword {k_idx}/{total_keywords}] '{keyword}' - "
                           f"page {page_idx + 1}/{max_pages}  ->  {build_search_url(keyword, page_idx)}")
-                    products, status = scrape_page(
-                        page, captured, keyword, page_idx, scroll_rounds, retries, debug)
+
+                    while True:
+                        try:
+                            products, status = scrape_page(
+                                page, captured, keyword, page_idx, scroll_rounds, retries, debug)
+                            break
+                        except Exception as exc:
+                            crashed = cfg.headless and is_target_closed_error(exc)
+                            if not crashed or restarts >= MAX_BROWSER_RESTARTS:
+                                raise
+                            restarts += 1
+                            print(f"[warn] Browser closed unexpectedly ({type(exc).__name__}); restarting it "
+                                  f"({restarts}/{MAX_BROWSER_RESTARTS})...", file=sys.stderr)
+                            session.close()
+                            session, page = start_browser()
 
                     if status == "quit":
                         stop_all = True
@@ -712,29 +1054,36 @@ def scrape_all(keywords: List[str], max_pages: int, profile_dir: str, scroll_rou
         except KeyboardInterrupt:
             print("\n[info] Interrupted by user; saving what has been collected so far.")
         except Exception as exc:
-            print(f"[error] Unexpected browser error: {exc!r}", file=sys.stderr)
+            print(f"[error] Unexpected browser error: {type(exc).__name__}: {exc}", file=sys.stderr)
         finally:
-            context.close()  # flushes cookies/session into the profile folder
+            session.close()  # flushes cookies/session into the profile folder (persistent mode)
 
     return store
 
 
 # --------------------------------------------------------------------------- #
-# Manual login helper (used by the Streamlit dashboard's "Open Shopee to log in" button)
+# Manual login helper (needs a visible browser, so it only works on your own computer)
 # --------------------------------------------------------------------------- #
-def login_session(profile_dir: str, channel: Optional[str]) -> None:
+def login_session(cfg: BrowserConfig) -> None:
     """
-    Open Shopee in the persistent profile so you can log in / solve a captcha by hand.
-    The session is saved to the profile folder; close the browser window when you are done.
+    Open Shopee in the persistent profile so you can log in / solve a captcha by hand. The session
+    is saved to the profile folder. If --storage-state FILE was given, it is also exported there
+    so a headless server (Streamlit Cloud) can reuse it. Close the browser window when done.
     """
+    if cfg.headless:
+        print("[error] Manual login needs a visible browser window. Run this on your own computer "
+              "(use --headed), not on a headless server.", file=sys.stderr)
+        return
+
+    export_path = cfg.storage_state
     with sync_playwright() as pw:
         try:
-            context = launch_context(pw, profile_dir, channel)
+            session = open_session(pw, dc_replace(cfg, ephemeral=False))
         except Exception as exc:
-            print(f"[error] Could not launch the persistent context: {exc!r}\n"
-                  "        Close any other browser using this profile folder and try again.",
-                  file=sys.stderr)
+            print_launch_help(exc)
             return
+
+        context = session.context
         context.add_init_script(STEALTH_JS)
         page = context.pages[0] if context.pages else context.new_page()
         try:
@@ -742,23 +1091,43 @@ def login_session(profile_dir: str, channel: Optional[str]) -> None:
         except PlaywrightTimeoutError:
             print("[warn] Navigation timed out; continuing.", file=sys.stderr)
         print("[info] Log in / solve any captcha, then CLOSE the browser window to save the session.")
+
+        last_state: Optional[Dict[str, Any]] = None
         try:
-            context.wait_for_event("close", timeout=0)  # returns when the window is closed
+            if export_path:
+                # Snapshot the session while the window is open; it is written once you close it.
+                while True:
+                    try:
+                        if not context.pages:
+                            break
+                        last_state = context.storage_state()
+                    except Exception:
+                        break
+                    time.sleep(1.5)
+            else:
+                context.wait_for_event("close", timeout=0)  # returns when the window is closed
         except KeyboardInterrupt:
             pass
         except Exception:
             pass
         finally:
-            try:
-                context.close()
-            except Exception:
-                pass
+            if export_path and last_state:
+                try:
+                    Path(export_path).write_text(
+                        json.dumps(last_state, ensure_ascii=False, indent=2), encoding="utf-8")
+                    print(f"[info] Saved session to '{export_path}'. Keep this file private "
+                          "(it contains your login cookies) and never commit it to a public repo.")
+                except OSError as exc:
+                    print(f"[warn] Could not write '{export_path}': {exc!r}", file=sys.stderr)
+            session.close()
 
 
 # --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    global INTERACTIVE
+
     parser = argparse.ArgumentParser(
         description="Scrape Shopee Thailand search results for multiple keywords with pagination.")
     parser.add_argument("--keywords", nargs="+", default=DEFAULT_KEYWORDS,
@@ -768,9 +1137,25 @@ def main() -> None:
     parser.add_argument("--scrolls", type=int, default=8, help="Scroll rounds per page")
     parser.add_argument("--retries", type=int, default=2,
                         help="Attempts per page (with a manual-fix pause between attempts)")
-    parser.add_argument("--profile", default=DEFAULT_PROFILE_DIR, help="User data dir")
+    parser.add_argument("--profile", default=DEFAULT_PROFILE_DIR, help="User data dir (persistent mode)")
     parser.add_argument("--channel", default=None, help='Browser channel, e.g. "chrome"')
     parser.add_argument("--output", default=DEFAULT_OUTPUT_CSV, help="Combined CSV output file")
+
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument("--headless", action="store_true",
+                         help="Force a headless browser (default on servers/cloud)")
+    display.add_argument("--headed", action="store_true",
+                         help="Force a visible browser window (default on your own computer)")
+    storage = parser.add_mutually_exclusive_group()
+    storage.add_argument("--ephemeral", action="store_true",
+                         help="Use a standard browser + fresh context instead of the profile folder "
+                              "(default on servers/cloud)")
+    storage.add_argument("--persistent", action="store_true",
+                         help="Force the persistent profile folder (default on your own computer)")
+    parser.add_argument("--storage-state", default=None, metavar="FILE",
+                        help="Saved login session JSON: loaded when scraping in ephemeral mode, "
+                             "written when used with --login")
+
     parser.add_argument("--login", action="store_true",
                         help="Only open Shopee in the profile for manual login/captcha, then exit")
     parser.add_argument("--no-print-json", action="store_true",
@@ -779,8 +1164,42 @@ def main() -> None:
                         help=f"Print payload structure and save raw JSON to ./{DEBUG_DIR}/")
     args = parser.parse_args()
 
+    # ---- decide how to run: desktop vs. cloud server --------------------------------------
+    cloud = is_cloud_environment()
+    display_available = has_display()
+
+    if args.headless:
+        headless = True
+    elif args.headed:
+        headless = False
+    else:
+        env_headless = env_flag("SHOPEE_HEADLESS")
+        headless = env_headless if env_headless is not None else (cloud or not display_available)
+
+    if args.ephemeral:
+        ephemeral = True
+    elif args.persistent:
+        ephemeral = False
+    else:
+        env_ephemeral = env_flag("SHOPEE_EPHEMERAL")
+        ephemeral = env_ephemeral if env_ephemeral is not None else cloud
+
+    server_mode = cloud or (sys.platform.startswith("linux") and not display_available)
+
+    try:
+        has_terminal = sys.stdin is not None and sys.stdin.isatty()
+    except (ValueError, OSError):
+        has_terminal = False
+    INTERACTIVE = (not headless) and has_terminal
+
+    cfg = BrowserConfig(profile_dir=args.profile, channel=args.channel, headless=headless,
+                        ephemeral=ephemeral, server_mode=server_mode, storage_state=args.storage_state)
+    print(f"[info] Environment: cloud={cloud}, display={display_available} | headless={headless}, "
+          f"context={'standard (no profile)' if ephemeral else 'persistent profile'}, "
+          f"container-safe flags={server_mode}, interactive={INTERACTIVE}")
+
     if args.login:
-        login_session(args.profile, args.channel)
+        login_session(cfg)
         return
 
     keywords = list(dict.fromkeys(k.strip() for k in args.keywords if k.strip()))
@@ -791,8 +1210,8 @@ def main() -> None:
     print(f"[info] Keywords: {keywords}")
     print(f"[info] Max pages per keyword: {max_pages} | output: {args.output}")
 
-    store = scrape_all(keywords, max_pages, args.profile, args.scrolls, max(1, args.retries),
-                       args.channel, args.debug, args.output)
+    store = scrape_all(keywords, max_pages, cfg, args.scrolls, max(1, args.retries),
+                       args.debug, args.output)
     products = store.all()
 
     if not args.no_print_json:
