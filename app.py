@@ -314,10 +314,12 @@ def render_login() -> None:
 
 
 def render_account_box() -> None:
-    """Top of the sidebar: who is signed in, plus the Logout button."""
-    st.sidebar.markdown(f"Signed in as **{st.session_state.get('username', 'user')}**")
-    st.sidebar.button("Logout", on_click=logout)
-    st.sidebar.divider()
+    """Top of the sidebar: user info, subscription status + upgrade button, then Logout."""
+    with st.sidebar:
+        st.markdown(f"Signed in as **{st.session_state.get('username', 'user')}**")
+        render_subscription_sidebar()
+        st.button("Logout", on_click=logout)
+        st.divider()
 
 
 # --------------------------------------------------------------------------- #
@@ -358,25 +360,35 @@ def portal_url() -> str:
     return get_setting("STRIPE_PORTAL_LINK", DEFAULT_PORTAL_LINK)
 
 
-def link_button(target, label: str, url: str, primary: bool = False) -> None:
+def link_button(target, label: str, url: str, primary: bool = False, full_width: bool = False) -> None:
     """Button that opens `url` in a new tab; plain link on Streamlit versions without link_button."""
-    if hasattr(target, "link_button"):
-        target.link_button(label, url, type="primary" if primary else "secondary")
-    else:
+    if not hasattr(target, "link_button"):
         target.markdown(f"[{label}]({url})")
+        return
+    kind = "primary" if primary else "secondary"
+    if full_width:
+        # Newer Streamlit uses width="stretch"; older versions use use_container_width=True.
+        for extra in ({"width": "stretch"}, {"use_container_width": True}):
+            try:
+                target.link_button(label, url, type=kind, **extra)
+                return
+            except Exception:
+                continue
+    target.link_button(label, url, type=kind)
 
 
 def render_subscription_sidebar() -> None:
-    """Compact plan status + upgrade button, always visible in the sidebar."""
+    """Prominent card: subscription status + full-width Stripe upgrade button (call inside the sidebar)."""
     plan = get_plan()
-    st.sidebar.subheader("Subscription")
-    st.sidebar.markdown(f"Current plan: **{PLANS[plan]['name']}**")
-    if plan == "free":
-        link_button(st.sidebar, UPGRADE_LABEL, checkout_url(), primary=True)
-        st.sidebar.caption("Unlock Pro features. Secure payment by Stripe.")
-    else:
-        link_button(st.sidebar, "Manage subscription", portal_url())
-    st.sidebar.divider()
+    with st.container(border=True):
+        st.markdown("**Subscription Status**")
+        if plan == "free":
+            st.info(PLANS["free"]["name"])
+            link_button(st, UPGRADE_LABEL, checkout_url(), primary=True, full_width=True)
+            st.caption("Unlock Pro features. Secure payment by Stripe.")
+        else:
+            st.success(f"{PLANS['pro']['name']} - active")
+            link_button(st, "Manage subscription", portal_url(), full_width=True)
 
 
 def render_plan_card(plan_key: str, current_plan: str) -> None:
@@ -609,9 +621,8 @@ def main() -> None:
         render_login()
         return
 
-    # ---- sidebar: account, subscription status, scraper settings ----
-    render_account_box()
-    render_subscription_sidebar()
+    # ---- sidebar: user info, subscription (upgrade), logout, then scraper settings ----
+    render_account_box()      # user info, subscription status + upgrade button, logout
     settings = render_sidebar()
 
     # ---- main area ----
