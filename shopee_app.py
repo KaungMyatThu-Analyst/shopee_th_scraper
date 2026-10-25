@@ -12,22 +12,31 @@ How it works: the dashboard starts `shopee_scraper_multi.py` as a separate proce
 Playwright/asyncio conflicts inside Streamlit), streams its log to show live progress, then loads
 the CSV it produced into an interactive table with filters and a download button.
 
-The scraper opens a real browser window on THIS computer (headless=False), so run the dashboard
-locally rather than on a remote server.
+The dashboard sits behind a simple login (test credentials: user / shopee123; override with the
+APP_USERNAME and APP_PASSWORD environment variables or Streamlit secrets).
+
+On your own computer the scraper opens a real browser window; on a server such as Streamlit Cloud
+it automatically runs headless with container-safe flags (see shopee_scraper_multi.py).
 """
 
+import hmac
 import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-import os 
-os.system("playwright install chromium")
+
+try:  # same detection the scraper uses, so the UI matches how the scraper will run
+    from shopee_scraper_multi import has_display, is_cloud_environment
+    SERVER_MODE = is_cloud_environment() or not has_display()
+except Exception:
+    SERVER_MODE = False
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -41,6 +50,12 @@ PRESET_KEYWORDS = ["skincare", "makeup", "sunscreen", "serum", "moisturizer", "l
 DEFAULT_SELECTION = ["skincare"]
 KEYWORD_SEP = "|"                             # separator used by the scraper's `keywords` column
 LOG_LINES_SHOWN = 12
+
+# Simple demo credentials for testing. For a real deployment set APP_USERNAME / APP_PASSWORD as
+# environment variables or Streamlit secrets instead of relying on these defaults.
+DEFAULT_USERNAME = "user"
+DEFAULT_PASSWORD = "shopee123"
+SESSION_KEYS_TO_CLEAR = ("authenticated", "username", "df", "csv_bytes", "csv_name", "log")
 
 # Progress is parsed from the scraper's log lines.
 RE_PAGE = re.compile(r"\[keyword (\d+)/(\d+)\] '(.*)' - page (\d+)/(\d+)")
@@ -196,6 +211,83 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# Authentication (basic login/logout backed by st.session_state)
+# --------------------------------------------------------------------------- #
+def get_credentials() -> Tuple[str, str]:
+    """Expected (username, password): env vars / Streamlit secrets if set, else the test defaults."""
+    username = os.environ.get("APP_USERNAME")
+    password = os.environ.get("APP_PASSWORD")
+    try:
+        username = username or st.secrets.get("APP_USERNAME")
+        password = password or st.secrets.get("APP_PASSWORD")
+    except Exception:  # no secrets.toml configured
+        pass
+    return str(username or DEFAULT_USERNAME), str(password or DEFAULT_PASSWORD)
+
+
+def check_credentials(username: str, password: str) -> bool:
+    """Constant-time comparison so response timing does not leak how much of a guess matched."""
+    expected_user, expected_pass = get_credentials()
+    user_ok = hmac.compare_digest((username or "").strip().encode("utf-8"), expected_user.encode("utf-8"))
+    pass_ok = hmac.compare_digest((password or "").encode("utf-8"), expected_pass.encode("utf-8"))
+    return user_ok and pass_ok
+
+
+def is_authenticated() -> bool:
+    return bool(st.session_state.get("authenticated", False))
+
+
+def rerun() -> None:
+    """st.rerun() on current Streamlit, st.experimental_rerun() on older versions."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+def logout() -> None:
+    """Sign out and drop everything held for this session (results, CSV bytes, run log)."""
+    for key in SESSION_KEYS_TO_CLEAR:
+        st.session_state.pop(key, None)
+
+
+def render_login() -> None:
+    """Centered login form shown instead of the dashboard while signed out."""
+    st.markdown("<style>[data-testid='stSidebar'] {display: none;}</style>", unsafe_allow_html=True)
+    _, middle, _ = st.columns([1, 1.4, 1])
+    with middle:
+        st.write("")
+        with st.container(border=True):
+            st.title("🛍️ Shopee Scraper")
+            st.caption("Sign in to continue.")
+            with st.form("login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                submitted = st.form_submit_button("Log in", type="primary")
+
+            if submitted:
+                if check_credentials(username, password):
+                    st.session_state["authenticated"] = True
+                    st.session_state["username"] = username.strip()
+                    st.session_state["failed_logins"] = 0
+                    rerun()
+                else:
+                    st.session_state["failed_logins"] = st.session_state.get("failed_logins", 0) + 1
+                    time.sleep(min(1 + st.session_state["failed_logins"], 5))  # slow down guessing
+                    st.error("Invalid username or password.")
+
+            if get_credentials() == (DEFAULT_USERNAME, DEFAULT_PASSWORD):
+                st.caption(f"Test login: `{DEFAULT_USERNAME}` / `{DEFAULT_PASSWORD}`")
+
+
+def render_account_box() -> None:
+    """Top of the sidebar: who is signed in, plus the Logout button."""
+    st.sidebar.markdown(f"Signed in as **{st.session_state.get('username', 'user')}**")
+    st.sidebar.button("Logout", on_click=logout)
+    st.sidebar.divider()
+
+
+# --------------------------------------------------------------------------- #
 # UI sections
 # --------------------------------------------------------------------------- #
 def render_sidebar() -> dict:
@@ -204,29 +296,39 @@ def render_sidebar() -> dict:
                                   help="Shopee shows roughly 60 products per page.")
     scrolls = st.sidebar.slider("Scroll rounds per page", 3, 15, 8,
                                 help="More scrolling loads more lazy-loaded products.")
-    use_chrome = st.sidebar.checkbox("Use installed Google Chrome", value=False,
-                                     help="A real Chrome install looks more natural than bundled Chromium.")
-    profile = st.sidebar.text_input("Browser profile folder", DEFAULT_PROFILE,
-                                    help="Keeps your Shopee login/captcha session between runs.")
+    if SERVER_MODE:
+        use_chrome = False
+        profile = DEFAULT_PROFILE
+        st.sidebar.divider()
+        st.sidebar.subheader("Server mode")
+        st.sidebar.caption(
+            "Running headless on a server: no browser window, no manual login, and a fresh browser "
+            "profile each run. If Shopee blocks the session, add a saved login session via the "
+            "SHOPEE_STORAGE_STATE_JSON secret (see README notes) or run the app on your own computer.")
+    else:
+        use_chrome = st.sidebar.checkbox("Use installed Google Chrome", value=False,
+                                         help="A real Chrome install looks more natural than bundled Chromium.")
+        profile = st.sidebar.text_input("Browser profile folder", DEFAULT_PROFILE,
+                                        help="Keeps your Shopee login/captcha session between runs.")
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Login / captcha")
-    st.sidebar.caption("Shopee often blocks logged-out sessions. Log in once here; "
-                       "the session is saved to the profile folder and reused by every run.")
-    if st.sidebar.button("Open Shopee to log in"):
-        proc = st.session_state.get("login_proc")
-        if not SCRAPER.exists():
-            st.sidebar.error(f"Missing {SCRAPER.name}")
-        elif proc is not None and proc.poll() is None:
-            st.sidebar.info("The login browser is already open.")
-        else:
-            cmd = [sys.executable, str(SCRAPER), "--login", "--profile", profile]
-            if use_chrome:
-                cmd += ["--channel", "chrome"]
-            st.session_state.login_proc = subprocess.Popen(
-                cmd, cwd=str(BASE_DIR), stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            st.sidebar.success("Browser opened. Log in, then CLOSE the window before scraping.")
+        st.sidebar.divider()
+        st.sidebar.subheader("Login / captcha")
+        st.sidebar.caption("Shopee often blocks logged-out sessions. Log in once here; "
+                           "the session is saved to the profile folder and reused by every run.")
+        if st.sidebar.button("Open Shopee to log in"):
+            proc = st.session_state.get("login_proc")
+            if not SCRAPER.exists():
+                st.sidebar.error(f"Missing {SCRAPER.name}")
+            elif proc is not None and proc.poll() is None:
+                st.sidebar.info("The login browser is already open.")
+            else:
+                cmd = [sys.executable, str(SCRAPER), "--login", "--profile", profile]
+                if use_chrome:
+                    cmd += ["--channel", "chrome"]
+                st.session_state.login_proc = subprocess.Popen(
+                    cmd, cwd=str(BASE_DIR), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                st.sidebar.success("Browser opened. Log in, then CLOSE the window before scraping.")
 
     st.sidebar.divider()
     st.sidebar.caption("Automated scraping is against Shopee's terms of service. "
@@ -291,7 +393,11 @@ def start_scrape(keywords: List[str], settings: dict) -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     csv_path = OUTPUT_DIR / f"shopee_products_{datetime.now():%Y%m%d_%H%M%S}.csv"
 
-    with st.spinner("Scraping Shopee... a browser window will open. Please leave it open."):
+    spinner_text = ("Scraping Shopee in a headless browser on the server... the first run may need a "
+                    "one-time browser install."
+                    if SERVER_MODE else
+                    "Scraping Shopee... a browser window will open. Please leave it open.")
+    with st.spinner(spinner_text):
         return_code, lines = run_scraper(
             keywords, settings["max_pages"], settings["scrolls"],
             settings["profile"], settings["use_chrome"], csv_path)
@@ -303,8 +409,12 @@ def start_scrape(keywords: List[str], settings: dict) -> None:
         st.session_state["df"] = None
         st.error("No products were collected." if return_code == 0
                  else f"The scraper exited with code {return_code} and collected nothing.")
-        st.info("Most often Shopee blocked the session. Click **Open Shopee to log in** in the sidebar, "
-                "log in, close that window, then run again. Check the run log below for details.")
+        if SERVER_MODE:
+            st.info("Most often Shopee blocked the server's session (datacenter IPs are frequently flagged) "
+                    "or the browser could not start. Check the run log below for details.")
+        else:
+            st.info("Most often Shopee blocked the session. Click **Open Shopee to log in** in the sidebar, "
+                    "log in, close that window, then run again. Check the run log below for details.")
         return
 
     st.session_state["df"] = df
@@ -333,6 +443,12 @@ def main() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+    # ---- authentication gate: nothing below this point is shown to signed-out visitors ----
+    if not is_authenticated():
+        render_login()
+        return
+    render_account_box()
 
     st.title("🛍️ Shopee Thailand Product Scraper")
     st.caption("Pick keywords, run the scraper, then explore and download the results.")
