@@ -55,7 +55,35 @@ LOG_LINES_SHOWN = 12
 # environment variables or Streamlit secrets instead of relying on these defaults.
 DEFAULT_USERNAME = "user"
 DEFAULT_PASSWORD = "shopee123"
-SESSION_KEYS_TO_CLEAR = ("authenticated", "username", "df", "csv_bytes", "csv_name", "log")
+SESSION_KEYS_TO_CLEAR = ("authenticated", "username", "plan", "df", "csv_bytes", "csv_name", "log")
+
+# ---- Subscription / pricing (Stripe) ---------------------------------------------------------
+# Replace the placeholders below (or set STRIPE_PAYMENT_LINK / STRIPE_PORTAL_LINK as env vars or
+# Streamlit secrets). The plan copy is placeholder text: edit PLANS to match what you really sell.
+DEFAULT_PAYMENT_LINK = "https://buy.stripe.com/test_placeholder"
+DEFAULT_PORTAL_LINK = "https://billing.stripe.com/p/login/test_placeholder"
+UPGRADE_LABEL = "Upgrade to Pro ($15/month)"
+PLANS = {
+    "free": {
+        "name": "Free Tier",
+        "price": "$0",
+        "features": [
+            "Multi-keyword Shopee search",
+            "Interactive results table with filters",
+            "CSV export",
+        ],
+    },
+    "pro": {
+        "name": "Pro Tier",
+        "price": "$15",
+        "features": [
+            "Everything in Free",
+            "Higher page and keyword limits (coming soon)",
+            "Saved search history (coming soon)",
+            "Priority support",
+        ],
+    },
+}
 
 # Progress is parsed from the scraper's log lines.
 RE_PAGE = re.compile(r"\[keyword (\d+)/(\d+)\] '(.*)' - page (\d+)/(\d+)")
@@ -213,16 +241,20 @@ def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Authentication (basic login/logout backed by st.session_state)
 # --------------------------------------------------------------------------- #
+def get_setting(name: str, default: str = "") -> str:
+    """Config value from an environment variable or Streamlit secrets, else `default`."""
+    value = os.environ.get(name)
+    if not value:
+        try:
+            value = st.secrets.get(name)
+        except Exception:  # no secrets.toml configured
+            value = None
+    return str(value) if value else default
+
+
 def get_credentials() -> Tuple[str, str]:
     """Expected (username, password): env vars / Streamlit secrets if set, else the test defaults."""
-    username = os.environ.get("APP_USERNAME")
-    password = os.environ.get("APP_PASSWORD")
-    try:
-        username = username or st.secrets.get("APP_USERNAME")
-        password = password or st.secrets.get("APP_PASSWORD")
-    except Exception:  # no secrets.toml configured
-        pass
-    return str(username or DEFAULT_USERNAME), str(password or DEFAULT_PASSWORD)
+    return get_setting("APP_USERNAME", DEFAULT_USERNAME), get_setting("APP_PASSWORD", DEFAULT_PASSWORD)
 
 
 def check_credentials(username: str, password: str) -> bool:
@@ -269,6 +301,7 @@ def render_login() -> None:
                 if check_credentials(username, password):
                     st.session_state["authenticated"] = True
                     st.session_state["username"] = username.strip()
+                    st.session_state["plan"] = lookup_plan(username)
                     st.session_state["failed_logins"] = 0
                     rerun()
                 else:
@@ -281,10 +314,115 @@ def render_login() -> None:
 
 
 def render_account_box() -> None:
-    """Top of the sidebar: who is signed in, plus the Logout button."""
-    st.sidebar.markdown(f"Signed in as **{st.session_state.get('username', 'user')}**")
-    st.sidebar.button("Logout", on_click=logout)
-    st.sidebar.divider()
+    """Top of the sidebar: user info, subscription status + upgrade button, then Logout."""
+    with st.sidebar:
+        st.markdown(f"Signed in as **{st.session_state.get('username', 'user')}**")
+        render_subscription_sidebar()
+        st.button("Logout", on_click=logout)
+        st.divider()
+
+
+# --------------------------------------------------------------------------- #
+# Subscription / pricing
+# --------------------------------------------------------------------------- #
+def lookup_plan(username: str) -> str:
+    """
+    Which plan a user is on: "free" or "pro".
+
+    DEMO ONLY: users listed in APP_PRO_USERS (comma-separated, env var or secret) count as Pro, so
+    you can preview both states. In production, replace this with a lookup of the user's real
+    subscription status, written by a Stripe webhook (checkout.session.completed /
+    customer.subscription.updated / customer.subscription.deleted) into your database.
+    """
+    pro_users = {u.strip().lower() for u in get_setting("APP_PRO_USERS").split(",") if u.strip()}
+    return "pro" if (username or "").strip().lower() in pro_users else "free"
+
+
+def get_plan() -> str:
+    plan = st.session_state.get("plan")
+    if plan not in PLANS:
+        plan = lookup_plan(st.session_state.get("username", ""))
+        st.session_state["plan"] = plan
+    return plan
+
+
+def checkout_url() -> str:
+    """Stripe Payment Link with the signed-in user attached as client_reference_id, so a webhook
+    can tell which account paid (Stripe allows only letters, digits, '-' and '_' there)."""
+    base = get_setting("STRIPE_PAYMENT_LINK", DEFAULT_PAYMENT_LINK)
+    ref = re.sub(r"[^A-Za-z0-9_-]", "_", st.session_state.get("username", ""))[:200]
+    if not ref:
+        return base
+    return f"{base}{'&' if '?' in base else '?'}client_reference_id={ref}"
+
+
+def portal_url() -> str:
+    return get_setting("STRIPE_PORTAL_LINK", DEFAULT_PORTAL_LINK)
+
+
+def link_button(target, label: str, url: str, primary: bool = False, full_width: bool = False) -> None:
+    """Button that opens `url` in a new tab; plain link on Streamlit versions without link_button."""
+    if not hasattr(target, "link_button"):
+        target.markdown(f"[{label}]({url})")
+        return
+    kind = "primary" if primary else "secondary"
+    if full_width:
+        # Newer Streamlit uses width="stretch"; older versions use use_container_width=True.
+        for extra in ({"width": "stretch"}, {"use_container_width": True}):
+            try:
+                target.link_button(label, url, type=kind, **extra)
+                return
+            except Exception:
+                continue
+    target.link_button(label, url, type=kind)
+
+
+def render_subscription_sidebar() -> None:
+    """Prominent card: subscription status + full-width Stripe upgrade button (call inside the sidebar)."""
+    plan = get_plan()
+    with st.container(border=True):
+        st.markdown("**Subscription Status**")
+        if plan == "free":
+            st.info(PLANS["free"]["name"])
+            link_button(st, UPGRADE_LABEL, checkout_url(), primary=True, full_width=True)
+            st.caption("Unlock Pro features. Secure payment by Stripe.")
+        else:
+            st.success(f"{PLANS['pro']['name']} - active")
+            link_button(st, "Manage subscription", portal_url(), full_width=True)
+
+
+def render_plan_card(plan_key: str, current_plan: str) -> None:
+    plan = PLANS[plan_key]
+    with st.container(border=True):
+        st.subheader(plan["name"])
+        st.markdown(f"### {plan['price']} / month")
+        st.markdown("\n".join(f"- {feature}" for feature in plan["features"]))
+        if plan_key == current_plan:
+            st.success("Your current plan")
+            if plan_key == "pro":
+                link_button(st, "Manage subscription (billing portal)", portal_url())
+        elif plan_key == "pro":
+            link_button(st, "Choose Pro - $15/month", checkout_url(), primary=True)
+
+
+def render_pricing() -> None:
+    """Main-area 'Subscription & Pricing' tab."""
+    plan = get_plan()
+    st.subheader("Subscription & pricing")
+
+    c1, c2 = st.columns(2)
+    c1.metric("Current plan", PLANS[plan]["name"])
+    c2.metric("Billing", "Free" if plan == "free" else f"{PLANS['pro']['price']} / month")
+
+    left, right = st.columns(2)
+    with left:
+        render_plan_card("free", plan)
+    with right:
+        render_plan_card("pro", plan)
+
+    st.caption("Payments are processed securely by Stripe. Cancel any time from the billing portal.")
+    if get_setting("STRIPE_PAYMENT_LINK", DEFAULT_PAYMENT_LINK) == DEFAULT_PAYMENT_LINK:
+        st.caption("Heads-up: the placeholder Stripe link is in use. Set STRIPE_PAYMENT_LINK to go live.")
 
 
 # --------------------------------------------------------------------------- #
@@ -428,33 +566,8 @@ def start_scrape(keywords: List[str], settings: dict) -> None:
                    "for more complete results.")
 
 
-def main() -> None:
-    st.set_page_config(page_title="Shopee TH Scraper", page_icon="🛍️", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .block-container {padding-top: 2rem; max-width: 1300px;}
-        [data-testid="stMetric"] {
-            background: rgba(128,128,128,0.08);
-            border: 1px solid rgba(128,128,128,0.2);
-            padding: 14px 16px; border-radius: 12px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # ---- authentication gate: nothing below this point is shown to signed-out visitors ----
-    if not is_authenticated():
-        render_login()
-        return
-    render_account_box()
-
-    st.title("🛍️ Shopee Thailand Product Scraper")
-    st.caption("Pick keywords, run the scraper, then explore and download the results.")
-
-    settings = render_sidebar()
-
+def render_scraper(settings: dict) -> None:
+    """The scraper dashboard: keyword picker, Run button, progress, results, downloads, log."""
     if not SCRAPER.exists():
         st.error(f"Could not find `{SCRAPER.name}` next to app.py. Put both files in the same folder.")
         return
@@ -485,6 +598,43 @@ def main() -> None:
     if st.session_state.get("log"):
         with st.expander("Run log"):
             st.code("\n".join(st.session_state["log"][-200:]), language=None)
+
+
+def main() -> None:
+    st.set_page_config(page_title="Shopee TH Scraper", page_icon="🛍️", layout="wide")
+    st.markdown(
+        """
+        <style>
+        .block-container {padding-top: 2rem; max-width: 1300px;}
+        [data-testid="stMetric"] {
+            background: rgba(128,128,128,0.08);
+            border: 1px solid rgba(128,128,128,0.2);
+            padding: 14px 16px; border-radius: 12px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ---- authentication gate: nothing below this point is shown to signed-out visitors ----
+    if not is_authenticated():
+        render_login()
+        return
+
+    # ---- sidebar: user info, subscription (upgrade), logout, then scraper settings ----
+    render_account_box()      # user info, subscription status + upgrade button, logout
+    settings = render_sidebar()
+
+    # ---- main area ----
+    st.title("🛍️ Shopee Thailand Product Scraper")
+    st.caption(f"Pick keywords, run the scraper, then explore and download the results. "
+               f"Plan: {PLANS[get_plan()]['name']}")
+
+    scraper_tab, pricing_tab = st.tabs(["🛍️ Scraper", "💎 Subscription & Pricing"])
+    with scraper_tab:
+        render_scraper(settings)
+    with pricing_tab:
+        render_pricing()
 
 
 if __name__ == "__main__":
