@@ -41,6 +41,7 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -398,17 +399,25 @@ def save_to_csv(products: List[Dict[str, Any]], filename: str = DEFAULT_OUTPUT_C
             if key not in fieldnames:
                 fieldnames.append(key)
 
+    tmp_name = f"{filename}.tmp"
     try:
-        with open(filename, "w", newline="", encoding="utf-8-sig") as fh:
+        # Write to a temp file and swap it in, so a job that is stopped mid-write can never leave a
+        # half-written CSV behind (the previous checkpoint stays intact).
+        with open(tmp_name, "w", newline="", encoding="utf-8-sig") as fh:
             writer = csv.DictWriter(fh, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(products)
+        os.replace(tmp_name, filename)
     except PermissionError:
         print(f"[error] Cannot write '{filename}'. Is it open in Excel? Close it and run again.",
               file=sys.stderr)
         return 0
     except OSError as exc:
         print(f"[error] Could not write '{filename}': {exc!r}", file=sys.stderr)
+        try:
+            os.remove(tmp_name)
+        except OSError:
+            pass
         return 0
     return len(products)
 
@@ -1123,10 +1132,32 @@ def login_session(cfg: BrowserConfig) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Graceful shutdown (the dashboard stops a job that runs too long or hangs)
+# --------------------------------------------------------------------------- #
+def install_graceful_shutdown() -> None:
+    """
+    Turn SIGTERM (and Ctrl-Break on Windows) into KeyboardInterrupt. scrape_all() already handles that
+    by closing the browser and returning what it has collected, and main() then saves the CSV, so a
+    job stopped for taking too long still keeps its partial results.
+    """
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    for name in ("SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, handler)
+            except (ValueError, OSError):   # not on the main thread / unsupported here
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # Entry point
 # --------------------------------------------------------------------------- #
 def main() -> None:
     global INTERACTIVE
+    install_graceful_shutdown()
 
     parser = argparse.ArgumentParser(
         description="Scrape Shopee Thailand search results for multiple keywords with pagination.")
@@ -1156,6 +1187,10 @@ def main() -> None:
                         help="Saved login session JSON: loaded when scraping in ephemeral mode, "
                              "written when used with --login")
 
+    parser.add_argument("--limit-keywords", type=int, default=None, metavar="N",
+                        help="Hard cap: refuse to run if more than N keywords are given (plan limit)")
+    parser.add_argument("--limit-pages", type=int, default=None, metavar="N",
+                        help="Hard cap: refuse to run if --max-pages is greater than N (plan limit)")
     parser.add_argument("--login", action="store_true",
                         help="Only open Shopee in the profile for manual login/captcha, then exit")
     parser.add_argument("--no-print-json", action="store_true",
@@ -1205,6 +1240,11 @@ def main() -> None:
     keywords = list(dict.fromkeys(k.strip() for k in args.keywords if k.strip()))
     if not keywords:
         parser.error("Provide at least one non-empty keyword.")
+    # Plan limits are passed in by the dashboard; refuse (never silently trim) when exceeded.
+    if args.limit_keywords is not None and len(keywords) > args.limit_keywords:
+        parser.error(f"{len(keywords)} keywords requested but the plan allows {args.limit_keywords} per run.")
+    if args.limit_pages is not None and args.max_pages > args.limit_pages:
+        parser.error(f"{args.max_pages} pages per keyword requested but the plan allows {args.limit_pages}.")
     max_pages = max(1, args.max_pages)
 
     print(f"[info] Keywords: {keywords}")
